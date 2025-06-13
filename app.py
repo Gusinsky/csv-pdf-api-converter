@@ -1,4 +1,6 @@
 import os
+import subprocess
+import time
 import pandas as pd
 import requests
 import json
@@ -7,7 +9,7 @@ import logging
 from pathlib import Path
 from flask import (
     Flask, render_template, request, redirect,
-    url_for, jsonify, session, send_from_directory
+    url_for, jsonify, session, send_from_directory, flash
 )
 from werkzeug.utils import secure_filename
 from robust_csv import robust_csv_cleaner
@@ -35,13 +37,15 @@ os.makedirs(app.config['TEMP_FOLDER'], exist_ok=True)
 os.makedirs(app.config['DATA_FOLDER'], exist_ok=True)
 
 # --- Globale variabelen ---
-DATAFRAME_STORAGE = {}
-SELECTED_COLS = {}
+DATAFRAME_STORAGE = None
+SELECTED_COLS = []
 COL_DESCRIPTIONS = {}
+MULTI_SEARCH_PARAM_NAME = None
+MULTI_SEARCH_COLS = []
 COL_TYPES_CACHE = {}
 COL_SAMPLES_CACHE = {}
-MULTI_SEARCH_PARAM_NAME = "q"
-MULTI_SEARCH_COLS = []
+NGROK_PROCESS = None
+NGROK_URL = None
 
 # --- OpenAI Client Initialisatie (optioneel) ---
 openai_api_key = os.environ.get("OPENAI_API_KEY")
@@ -122,14 +126,15 @@ def generate_column_descriptions_with_llm(context, columns, samples, max_sample_
 # --- Route: Index ---
 @app.route("/")
 def index():
-    global DATAFRAME_STORAGE, SELECTED_COLS, COL_DESCRIPTIONS, MULTI_SEARCH_PARAM_NAME, MULTI_SEARCH_COLS, COL_TYPES_CACHE, COL_SAMPLES_CACHE
-    DATAFRAME_STORAGE = {}
-    SELECTED_COLS = {}
+    global DATAFRAME_STORAGE, SELECTED_COLS, COL_DESCRIPTIONS, MULTI_SEARCH_PARAM_NAME, MULTI_SEARCH_COLS, COL_TYPES_CACHE, COL_SAMPLES_CACHE, NGROK_URL
+    DATAFRAME_STORAGE = None
+    SELECTED_COLS = []
     COL_DESCRIPTIONS = {}
-    MULTI_SEARCH_PARAM_NAME = "q"
+    MULTI_SEARCH_PARAM_NAME = None
     MULTI_SEARCH_COLS = []
     COL_TYPES_CACHE = {}
     COL_SAMPLES_CACHE = {}
+    NGROK_URL = None
     session.clear()
     return render_template("index.html")
 
@@ -303,7 +308,7 @@ def parse_int_param(param_value, default, min_val, max_val):
 # --- Route: Upload (CSV, PDF, JSON) ---
 @app.route("/upload", methods=["POST"])
 def upload_file():
-    global DATAFRAME_STORAGE, SELECTED_COLS, COL_DESCRIPTIONS, MULTI_SEARCH_PARAM_NAME, MULTI_SEARCH_COLS, COL_TYPES_CACHE, COL_SAMPLES_CACHE
+    global DATAFRAME_STORAGE, SELECTED_COLS, COL_DESCRIPTIONS, MULTI_SEARCH_PARAM_NAME, MULTI_SEARCH_COLS, COL_TYPES_CACHE, COL_SAMPLES_CACHE, NGROK_URL
 
     file_type = request.form.get("file_type", "csv").lower()
     uploaded_file = request.files.get("file")
@@ -332,23 +337,23 @@ def upload_file():
             if df.empty and os.path.getsize(temp_path) > 0:
                 logger.warning(f"CSV cleaner empty DF: {temp_path}.")
 
-            DATAFRAME_STORAGE[session["current_dataset_slug"]] = df
+            DATAFRAME_STORAGE = df
             COL_TYPES_CACHE = {}
             COL_SAMPLES_CACHE = {}
-            SELECTED_COLS[session["current_dataset_slug"]] = []
+            SELECTED_COLS = []
             MULTI_SEARCH_PARAM_NAME = None
             MULTI_SEARCH_COLS = []
-            COL_DESCRIPTIONS[session["current_dataset_slug"]] = {}
-            analyze_columns_for_display(df)
+            COL_DESCRIPTIONS = {}
+            analyze_columns_for_display(DATAFRAME_STORAGE)
             logger.info("Column analysis complete.")
 
-            if not df.empty:
-                COL_DESCRIPTIONS[session["current_dataset_slug"]] = generate_column_descriptions_with_llm(
+            if not DATAFRAME_STORAGE.empty:
+                COL_DESCRIPTIONS = generate_column_descriptions_with_llm(
                     context=dataset_context,
-                    columns=list(df.columns),
+                    columns=list(DATAFRAME_STORAGE.columns),
                     samples=COL_SAMPLES_CACHE,
                 )
-                logger.info(f"LLM descriptions: {len(COL_DESCRIPTIONS[session['current_dataset_slug']])} generated.")
+                logger.info(f"LLM descriptions: {len(COL_DESCRIPTIONS)} generated.")
             else:
                 logger.info("Skipping LLM for empty DF.")
 
@@ -378,9 +383,9 @@ def upload_file():
         pdf_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
         try:
             # Reset oude DataFrame
-            DATAFRAME_STORAGE[session["current_dataset_slug"]] = None
-            SELECTED_COLS[session["current_dataset_slug"]] = []
-            COL_DESCRIPTIONS[session["current_dataset_slug"]] = {}
+            DATAFRAME_STORAGE = None
+            SELECTED_COLS = []
+            COL_DESCRIPTIONS = {}
             MULTI_SEARCH_PARAM_NAME = None
             MULTI_SEARCH_COLS = []
             COL_TYPES_CACHE = {}
@@ -424,15 +429,15 @@ def upload_file():
                 pass
             return redirect(url_for("index"))
 
-        DATAFRAME_STORAGE[session["current_dataset_slug"]] = df
+        DATAFRAME_STORAGE = df
         COL_TYPES_CACHE = {}
         COL_SAMPLES_CACHE = {}
-        SELECTED_COLS[session["current_dataset_slug"]] = list(df.columns)
+        SELECTED_COLS = list(df.columns)
         MULTI_SEARCH_PARAM_NAME = None
         MULTI_SEARCH_COLS = []
-        COL_DESCRIPTIONS[session["current_dataset_slug"]] = {}
-        analyze_columns_for_display(df)
-        logger.info(f"JSON DataFrame loaded: {df.shape}")
+        COL_DESCRIPTIONS = {}
+        analyze_columns_for_display(DATAFRAME_STORAGE)
+        logger.info(f"JSON DataFrame loaded: {DATAFRAME_STORAGE.shape}")
 
         # Verwijder eventueel input.csv
         csv_path = os.path.join(json_dir, "input.csv")
@@ -453,15 +458,15 @@ def upload_file():
 @app.route("/analyze")
 def analyze():
     global DATAFRAME_STORAGE, SELECTED_COLS, MULTI_SEARCH_PARAM_NAME, MULTI_SEARCH_COLS, COL_TYPES_CACHE, COL_SAMPLES_CACHE, COL_DESCRIPTIONS
-    if DATAFRAME_STORAGE.get(session.get("current_dataset_slug")) is None or session.get("file_type") not in ["csv", "json"]:
+    if DATAFRAME_STORAGE is None or session.get("file_type") not in ["csv", "json"]:
         return redirect(url_for("index"))
 
     if not COL_TYPES_CACHE or not COL_SAMPLES_CACHE:
-        analyze_columns_for_display(DATAFRAME_STORAGE[session.get("current_dataset_slug")])
+        analyze_columns_for_display(DATAFRAME_STORAGE)
 
-    all_columns = list(DATAFRAME_STORAGE[session.get("current_dataset_slug")].columns)
+    all_columns = list(DATAFRAME_STORAGE.columns)
     full_descriptions = {
-        col: COL_DESCRIPTIONS.get(session.get("current_dataset_slug"))[col] or guess_description(col)
+        col: COL_DESCRIPTIONS.get(col) or guess_description(col)
         for col in all_columns
     }
     logger.debug(f"Rendering analyze.html: {len(all_columns)} cols")
@@ -471,7 +476,7 @@ def analyze():
         col_types=COL_TYPES_CACHE,
         samples=COL_SAMPLES_CACHE,
         col_descriptions=full_descriptions,
-        current_selected_cols=SELECTED_COLS.get(session.get("current_dataset_slug"), []),
+        current_selected_cols=SELECTED_COLS,
         current_multi_param_name=MULTI_SEARCH_PARAM_NAME,
         current_multi_selected_cols=MULTI_SEARCH_COLS
     )
@@ -480,23 +485,23 @@ def analyze():
 @app.route("/select_columns_and_configure_multi", methods=["POST"])
 def select_columns_and_configure_multi():
     global SELECTED_COLS, MULTI_SEARCH_PARAM_NAME, MULTI_SEARCH_COLS, DATAFRAME_STORAGE
-    if DATAFRAME_STORAGE.get(session.get("current_dataset_slug")) is None or session.get("file_type") not in ["csv", "json"]:
+    if DATAFRAME_STORAGE is None or session.get("file_type") not in ["csv", "json"]:
         return redirect(url_for("index"))
 
-    SELECTED_COLS[session.get("current_dataset_slug")] = request.form.getlist("selected_cols")
-    logger.info(f"Selected cols: {SELECTED_COLS[session.get('current_dataset_slug')]}")
+    SELECTED_COLS = request.form.getlist("selected_cols")
+    logger.info(f"Selected cols: {SELECTED_COLS}")
     enable_multi = request.form.get("enable_multi_search")
 
     if enable_multi:
         param_name = request.form.get("multi_param_name", "query").strip()
         param_name_sanitized = re.sub(r"\W+", "", param_name) or "query"
-        if param_name_sanitized in SELECTED_COLS[session.get("current_dataset_slug")]:
+        if param_name_sanitized in SELECTED_COLS:
             param_name_sanitized = f"{param_name_sanitized}_multi"
             logger.warning(f"Multi param rename: '{param_name_sanitized}'.")
 
         MULTI_SEARCH_PARAM_NAME = param_name_sanitized
         MULTI_SEARCH_COLS = request.form.getlist("multi_search_target_cols")
-        all_df_columns = list(DATAFRAME_STORAGE[session.get("current_dataset_slug")].columns)
+        all_df_columns = list(DATAFRAME_STORAGE.columns)
         valid_multi_cols = [col for col in MULTI_SEARCH_COLS if col in all_df_columns]
         if len(valid_multi_cols) != len(MULTI_SEARCH_COLS):
             logger.warning(f"Invalid multi cols ignored: {set(MULTI_SEARCH_COLS) - set(valid_multi_cols)}")
@@ -512,33 +517,44 @@ def select_columns_and_configure_multi():
         MULTI_SEARCH_COLS = []
         logger.info("Multi disabled.")
 
-    all_df_columns = list(DATAFRAME_STORAGE[session.get("current_dataset_slug")].columns)
-    valid_selected_cols = [col for col in SELECTED_COLS[session.get("current_dataset_slug")] if col in all_df_columns]
-    if len(valid_selected_cols) != len(SELECTED_COLS[session.get("current_dataset_slug")]):
-        logger.warning(f"Invalid selected cols ignored: {set(SELECTED_COLS[session.get('current_dataset_slug')]) - set(valid_selected_cols)}")
-        SELECTED_COLS[session.get("current_dataset_slug")] = valid_selected_cols
+    all_df_columns = list(DATAFRAME_STORAGE.columns)
+    valid_selected_cols = [col for col in SELECTED_COLS if col in all_df_columns]
+    if len(valid_selected_cols) != len(SELECTED_COLS):
+        logger.warning(f"Invalid selected cols ignored: {set(SELECTED_COLS) - set(valid_selected_cols)}")
+        SELECTED_COLS = valid_selected_cols
 
     return redirect(url_for("generate_api"))
 
 # --- Route: Generate API Info Page ---
-@app.route("/generate/<dataset_slug>")
-def generate(dataset_slug):
-    if dataset_slug not in DATAFRAME_STORAGE:
+@app.route("/generate")
+def generate_api():
+    global DATAFRAME_STORAGE, SELECTED_COLS, COL_DESCRIPTIONS, COL_TYPES_CACHE, COL_SAMPLES_CACHE, NGROK_URL, MULTI_SEARCH_PARAM_NAME, MULTI_SEARCH_COLS
+    if DATAFRAME_STORAGE is None or session.get("file_type") not in ["csv", "json"]:
         return redirect(url_for("index"))
-    
-    df = DATAFRAME_STORAGE[dataset_slug]
-    current_slug = dataset_slug
-    
+
+    final_descriptions = {
+        col: COL_DESCRIPTIONS.get(col) or guess_description(col)
+        for col in SELECTED_COLS
+    }
+    multi_col_details = {}
+    if MULTI_SEARCH_PARAM_NAME and MULTI_SEARCH_COLS:
+        for col in MULTI_SEARCH_COLS:
+            multi_col_details[col] = {
+                "description": COL_DESCRIPTIONS.get(col) or guess_description(col),
+                "type": COL_TYPES_CACHE.get(col, "Unknown"),
+                "samples": COL_SAMPLES_CACHE.get(col, []),
+            }
+
     return render_template(
         "generate.html",
-        dataset_slug=current_slug,
-        columns=df.columns.tolist(),
-        selected_cols=SELECTED_COLS.get(current_slug, []),
-        col_descriptions=COL_DESCRIPTIONS.get(current_slug, {}),
-        col_types=COL_TYPES_CACHE.get(current_slug, {}),
-        col_samples=COL_SAMPLES_CACHE.get(current_slug, {}),
-        multi_search_param_name=MULTI_SEARCH_PARAM_NAME,
-        multi_search_cols=MULTI_SEARCH_COLS
+        selected_cols=SELECTED_COLS,
+        descriptions=final_descriptions,
+        col_types=COL_TYPES_CACHE,
+        samples=COL_SAMPLES_CACHE,
+        ngrok_url=NGROK_URL,
+        multi_param_name=MULTI_SEARCH_PARAM_NAME,
+        multi_search_cols=MULTI_SEARCH_COLS,
+        multi_col_details=multi_col_details
     )
 
 # --- API Endpoint: /api/data/<slug> ---
@@ -659,9 +675,158 @@ def schema():
         return jsonify({"error": "No data currently loaded."}), 400
     return jsonify({"columns": SELECTED_COLS})
 
+# --- Route: Start Ngrok (GET en POST) ---
+@app.route("/start_ngrok", methods=["GET", "POST"])
+def start_ngrok():
+    global NGROK_PROCESS, NGROK_URL
+
+    if request.method == "POST":
+        auth_token = request.form.get("auth_token", "").strip()
+        if not auth_token:
+            session["ngrok_error"] = "Ngrok Authtoken cannot be empty."
+            return redirect(url_for("start_ngrok"))
+
+        ngrok_cmd = "ngrok.exe" if os.name == "nt" else "ngrok"
+
+        # 1) Configureer het token
+        try:
+            logger.info("Configuring Ngrok authtoken...")
+            result = subprocess.run(
+                [ngrok_cmd, "config", "add-authtoken", auth_token],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            logger.info(f"Ngrok authtoken config output: {result.stdout}")
+        except FileNotFoundError:
+            session["ngrok_error"] = "'ngrok' command not found. Check PATH."
+            return redirect(url_for("start_ngrok"))
+        except subprocess.CalledProcessError as e:
+            error_message = f"Failed to set Ngrok authtoken: {e.stderr or e.stdout or e}"
+            logger.error(error_message)
+            session["ngrok_error"] = error_message
+            return redirect(url_for("start_ngrok"))
+        except subprocess.TimeoutExpired:
+            session["ngrok_error"] = "Ngrok command timed out setting token."
+            return redirect(url_for("start_ngrok"))
+        except Exception as e:
+            logger.error(f"Unexpected error configuring Ngrok token: {e}", exc_info=True)
+            session["ngrok_error"] = f"Unexpected token error: {e}"
+            return redirect(url_for("start_ngrok"))
+
+        # 2) Indien al een tunnel draaide, stop die eerst netjes
+        if NGROK_PROCESS and NGROK_PROCESS.poll() is None:
+            try:
+                logger.info("Terminating previous Ngrok process...")
+                NGROK_PROCESS.terminate()
+                NGROK_PROCESS.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning("Ngrok did not terminate gracefully, killing.")
+                NGROK_PROCESS.kill()
+            except Exception as e:
+                logger.error(f"Error terminating previous Ngrok process: {e}")
+            finally:
+                NGROK_PROCESS = None
+                NGROK_URL = None
+
+        NGROK_URL = None
+        time.sleep(0.5)  # even kort pauzeren zodat de poort 4040 herstart kan afhandelen
+
+        # 3) Start de nieuwe ngrok-tunnel
+        try:
+            logger.info("Starting Ngrok HTTP tunnel on port 5000...")
+            startupinfo = None
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+
+            NGROK_PROCESS = subprocess.Popen(
+                [ngrok_cmd, "http", "5000", "--log=stdout"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                startupinfo=startupinfo
+            )
+            logger.info(f"Started Ngrok process (PID: {NGROK_PROCESS.pid})")
+            time.sleep(4)  # wachttijd om de tunnel op te zetten
+
+            if NGROK_PROCESS.poll() is not None:
+                # Ngrok is plots gestopt in plaats van succesvol te runnen
+                stderr_output = NGROK_PROCESS.stderr.read()
+                stdout_output = NGROK_PROCESS.stdout.read()
+                error_msg = f"Ngrok terminated unexpectedly. Stderr:{stderr_output or 'N/A'} Stdout:{stdout_output or 'N/A'}"
+                logger.error(error_msg)
+                session["ngrok_error"] = "Ngrok failed. Check logs."
+                NGROK_PROCESS = None
+                return redirect(url_for("start_ngrok"))
+
+            # 4) Haal de publieke URL op via de lokale API van ngrok
+            try:
+                logger.info("Fetching tunnel URL from Ngrok API...")
+                resp = requests.get("http://127.0.0.1:4040/api/tunnels", timeout=10)
+                resp.raise_for_status()
+                tunnels = resp.json().get("tunnels", [])
+                logger.debug(f"Ngrok tunnels response: {tunnels}")
+                https_tunnel = next(
+                    (tunnel for tunnel in tunnels
+                     if tunnel.get("proto") == "https"
+                     and "localhost:5000" in tunnel.get("config", {}).get("addr", "")),
+                    None
+                )
+                if https_tunnel and https_tunnel.get("public_url"):
+                    NGROK_URL = https_tunnel["public_url"]
+                    logger.info(f"Ngrok tunnel URL: {NGROK_URL}")
+                    session.pop("ngrok_error", None)
+
+                    # 5) Redirect naar de correcte “generate-pagina” op basis van bestandstype
+                    file_type = session.get("file_type")
+                    if file_type == "pdf":
+                        return redirect(url_for("generate_pdf"))
+                    elif file_type in ["csv", "json"]:
+                        # zowel CSV als JSON leiden naar dezelfde generate_api-pagina
+                        return redirect(url_for("generate_api"))
+                    else:
+                        logger.warning(f"Ngrok gestart, maar onbekend file_type '{file_type}'. Redirecting to index.")
+                        return redirect(url_for("index"))
+                else:
+                    logger.error(f"HTTPS tunnel to localhost:5000 not found in {tunnels}")
+                    session["ngrok_error"] = "Could not find correct Ngrok tunnel."
+                    if NGROK_PROCESS and NGROK_PROCESS.poll() is None:
+                        NGROK_PROCESS.terminate()
+                    NGROK_PROCESS = None
+                    NGROK_URL = None
+                    return redirect(url_for("start_ngrok"))
+            except requests.exceptions.RequestException as req_err:
+                logger.error(f"Failed to connect to Ngrok API: {req_err}")
+                session["ngrok_error"] = "Failed get tunnel URL from Ngrok API."
+                if NGROK_PROCESS and NGROK_PROCESS.poll() is None:
+                    NGROK_PROCESS.terminate()
+                NGROK_PROCESS = None
+                NGROK_URL = None
+                return redirect(url_for("start_ngrok"))
+
+        except Exception as launch_e:
+            logger.error(f"Error launching/managing Ngrok: {launch_e}", exc_info=True)
+            session["ngrok_error"] = f"Ngrok start error: {launch_e}"
+            if NGROK_PROCESS and NGROK_PROCESS.poll() is None:
+                try:
+                    NGROK_PROCESS.terminate()
+                except Exception:
+                    pass
+            NGROK_PROCESS = None
+            NGROK_URL = None
+            return redirect(url_for("start_ngrok"))
+
+    # Bij een GET-request of als er een fout in de POST optrad, render de setup-pagina
+    ngrok_error = session.pop("ngrok_error", None)
+    return render_template("start_ngrok.html", ngrok_error=ngrok_error)
+
 # --- Route: Generate PDF Page ---
 @app.route("/generate_pdf")
 def generate_pdf():
+    global NGROK_URL
     filename = session.get("uploaded_filename")
     file_type = session.get("file_type")
     if not filename or file_type != "pdf":
@@ -674,14 +839,18 @@ def generate_pdf():
         local_base = request.host_url.rstrip("/")
         pdf_rel = url_for("uploaded_file", filename=filename)
         local_url = f"{local_base}{pdf_rel}"
-        logger.info(f"PDF URL: Local={local_url}")
+        public_url = f"{NGROK_URL}{pdf_rel}" if NGROK_URL else None
+        logger.info(f"PDF URLs: Local={local_url}, Public={public_url}")
     except Exception as url_e:
         logger.error(f"PDF URL err: {url_e}")
         local_url = "#err"
+        public_url = "#err" if NGROK_URL else None
     return render_template(
         "generate_pdf.html",
         local_pdf_url=local_url,
-        filename=filename
+        public_pdf_url=public_url,
+        filename=filename,
+        ngrok_running=bool(NGROK_URL),
     )
 
 # --- Route: Serve Uploaded Files ---

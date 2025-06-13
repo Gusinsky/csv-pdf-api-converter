@@ -1,3 +1,4 @@
+# filename: cloudflare_tunnel.py
 import os
 import random
 import string
@@ -16,6 +17,7 @@ class CloudflareTunnelManager:
         self.cloudflared_process = None
         self.is_cleaning_up = False
 
+        # Register the cleanup function to be called upon script exit
         atexit.register(self.cleanup)
 
     def generate_random_prefix(self):
@@ -31,6 +33,7 @@ class CloudflareTunnelManager:
                 'Content-Type': 'application/json'
             }
 
+            # 1. Create the Tunnel
             print(f"Creating tunnel: {self.tunnel_name}...")
             tunnel_creation_url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/cfd_tunnel"
             tunnel_data = {'name': self.tunnel_name, 'tunnel_secret': os.urandom(32).hex()}
@@ -40,6 +43,7 @@ class CloudflareTunnelManager:
             self.tunnel_id = tunnel['id']
             print(f"✅ Tunnel created with ID: {self.tunnel_id}")
 
+            # 2. Create DNS CNAME Record
             subdomain = STATIC_SUBDOMAIN if USE_STATIC_URL else self.generate_random_prefix()
             self.tunnel_url = f"{subdomain}.{DOMAIN}"
             print(f"Creating DNS record for: {self.tunnel_url}...")
@@ -58,6 +62,7 @@ class CloudflareTunnelManager:
             response.raise_for_status()
             print("✅ DNS record created successfully.")
 
+            # 3. Configure Tunnel Routing
             print("Configuring tunnel routing...")
             config_url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/cfd_tunnel/{self.tunnel_id}/configurations"
             config_data = {
@@ -72,6 +77,7 @@ class CloudflareTunnelManager:
             response.raise_for_status()
             print("✅ Tunnel routing configured.")
             
+            # 4. Get the Tunnel Token
             print("Retrieving tunnel token...")
             token_url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/cfd_tunnel/{self.tunnel_id}/token"
             response = requests.get(token_url, headers=headers)
@@ -99,9 +105,11 @@ class CloudflareTunnelManager:
         command = ["cloudflared", "tunnel", "run", "--token", self.tunnel_token]
         
         try:
+            # Start the cloudflared process
             self.cloudflared_process = subprocess.Popen(command)
             print(f"✅ Connector process started with PID: {self.cloudflared_process.pid}")
             
+            # This call will block until the process is terminated (e.g., by cleanup)
             self.cloudflared_process.wait()
 
         except FileNotFoundError:
